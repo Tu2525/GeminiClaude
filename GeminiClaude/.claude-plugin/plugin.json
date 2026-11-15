@@ -1,0 +1,17 @@
+{
+  "name": "GeminiClaude",
+  "version": "0.1.0",
+  "author": { "name": "Tu2525" },
+  "license": "MIT",
+  "repository": "https://github.com/Tu2525/GeminiClaude",
+  "types": "./types/index.d.ts",
+  "description": "Offer Gemini models (Antigravity CLI, agy) alongside Claude subagents",
+  "userConfig": {
+    "askOnSpawn": {
+      "type": "boolean",
+      "title": "Ask Claude or Gemini on each subagent",
+      "description": "Before a Claude subagent starts, ask whether to run it on a Gemini model instead",
+      "default": false
+    }
+  }
+}

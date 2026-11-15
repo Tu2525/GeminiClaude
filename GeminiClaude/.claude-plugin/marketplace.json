@@ -1,0 +1,13 @@
+{
+  "name": "GeminiClaude",
+  "owner": { "name": "tu2525" },
+  "description": "GeminiClaude: run Claude Code subagents on Gemini models through agy.",
+  "plugins": [
+    {
+      "name": "GeminiClaude",
+      "source": "./",
+      "description": "Offer Gemini models (Antigravity CLI, agy) alongside Claude subagents",
+      "version": "0.1.0"
+    }
+  ]
+}

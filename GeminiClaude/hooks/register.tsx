@@ -4,7 +4,9 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Run } from '../types'
 
 const running = atom({ plugin: 'GeminiClaude', key: 'running' } as const, [])
-const last = atom({ plugin: 'GeminiClaude', key: 'last' } as const, null)
+/// Finished runs, newest first.
+const recent = atom({ plugin: 'GeminiClaude', key: 'recent' } as const, [])
+const isOpen = atom({ plugin: 'GeminiClaude', key: 'isOpen' } as const, false)
 const isHidden = atom({ plugin: 'GeminiClaude', key: 'isHidden' } as const, false)
 
 // Agent types a Gemini run can't stand in for: a fork needs this conversation,
@@ -17,6 +19,7 @@ const TEN_MINUTES = 600_000
 const MAX_PROMPT = 30_000
 // ponytail: a guess at what the plan's unpublished rate limit bears; raise it if runs don't get throttled.
 const MAX_PARALLEL = 5
+const MAX_RECENT = 5
 
 /// Model slugs `agy models` listed at session start; empty when agy is missing.
 let models: string[] = []
@@ -178,9 +181,10 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const runs = await read($, running)
-    const done = await read($, last)
+    const done = await read($, recent)
+    const open = await read($, isOpen)
     const now = runs[runs.length - 1] // the latest-started run still in flight
-    const shown: Run | null = now ?? done
+    const shown: Run | null = now ?? done[0] ?? null
     if (e.props.hasSurvey || models.length === 0 || (await read($, isHidden))) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     const below = await next(e) // other mods' bands stack under this one
@@ -205,17 +209,30 @@ export const register: Register = (on, options) => {
             <Box flexGrow={1} flexShrink={1} minWidth={0}>
               <Text dimColor wrap="truncate-end">{status}</Text>
             </Box>
+            <Button key="agents" plain label={open ? '▴ agents' : '▾ agents'} onPress={() => update($, isOpen, o => !o)} />
             <Button key="hide" plain label="Hide" onPress={() => update($, isHidden, () => true)} />
           </Box>
           {/* One row per agent still in flight; a finished one drops off. */}
-          {runs.length > 1 &&
+          {(open || runs.length > 1) &&
             runs.map(r => (
               <Box key={String(r.id)} flexDirection="row" gap={1}>
                 <Text color="suggestion">›</Text>
                 <Box flexGrow={1} flexShrink={1} minWidth={0}>
                   <Text wrap="truncate-end">{r.label}</Text>
                 </Box>
-                <Text dimColor>{r.model}</Text>
+                {/* ponytail: start time, not a live counter; tick an atom with $.clock.every if one is wanted. */}
+                <Text dimColor>{r.model}{open && r.started ? ` · since ${new Date(r.started).toLocaleTimeString()}` : ''}</Text>
+              </Box>
+            ))}
+          {open && runs.length === 0 && <Text dimColor>no agents running</Text>}
+          {open &&
+            done.map((r, i) => (
+              <Box key={`done-${i}`} flexDirection="row" gap={1}>
+                <Text color={r.ok === false ? 'error' : 'success'}>{r.ok === false ? '✗' : '✓'}</Text>
+                <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                  <Text dimColor wrap="truncate-end">{r.label}</Text>
+                </Box>
+                <Text dimColor>{r.model} · {r.seconds}s{r.tokens ? ` · ${r.tokens.toLocaleString()} tokens` : ''}</Text>
               </Box>
             ))}
         </Box>
@@ -281,14 +298,14 @@ async function runAgy($: EngineInterface, model: string, prompt: string, label: 
   const id = ++seq
   let out: { text: string; ok: boolean; tokens?: number } = { text: '', ok: false }
   try {
-    await update($, running, runs => [...runs, { id, model, label }])
+    await update($, running, runs => [...runs, { id, model, label, started }])
     await update($, isHidden, () => false)
     out = await callAgy($, model, prompt)
     return out.text
   } finally {
     const seconds = Math.round((Date.now() - started) / 100) / 10
-    // `last` first, so the band never draws the previous result between the two writes.
-    await update($, last, () => ({ model, label, seconds, tokens: out.tokens, ok: out.ok }))
+    // `recent` first, so the band never draws the previous result between the two writes.
+    await update($, recent, rs => [{ model, label, seconds, tokens: out.tokens, ok: out.ok }, ...rs].slice(0, MAX_RECENT))
     await update($, running, runs => runs.filter(r => r.id !== id))
   }
 }

@@ -302,3 +302,26 @@ test('17 auto: the arne judge picks family and effort from the brief', async ($,
   await go(MODEL) // an explicit slug skips the judge
   expect(asked.length).toBe(5)
 })
+
+test('18 the agents dropdown lists running agents, then finished ones', async ($, on) => {
+  const gates: ((r: Run) => void)[] = []
+  const t = await boot($, on, () => new Promise<Run>(res => gates.push(res)))
+  const a = t.delegate(MODEL, 'one', 'slow job')
+  while (gates.length < 1) await new Promise(r => setTimeout(r, 5))
+
+  let ui = await $.ui.mount(BAND('terminal'))
+  expect(await ui.find({ type: 'Text', text: /since/ })).toBeFalsy()
+  await ui.press({ key: 'agents' })
+  expect(await ui.find({ type: 'Text', text: /^slow job$/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: new RegExp(`${MODEL} · since`) })).toBeTruthy()
+  await ui.unmount()
+
+  gates[0]!(OK)
+  await a
+  ui = await $.ui.mount(BAND('terminal')) // still open: the choice is session state
+  expect(await ui.find({ type: 'Text', text: /no agents running/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /^slow job$/ })).toBeTruthy()
+  await ui.press({ key: 'agents' })
+  expect(await ui.find({ type: 'Text', text: /no agents running/ })).toBeFalsy()
+  await ui.unmount()
+})

@@ -94,7 +94,7 @@ test('1 model enum is the 7 slugs in order', async ($, on) => {
   const t = await boot($, on)
   expect(t.tools.length).toBe(1)
   expect(t.tools[0].name).toBe('delegate')
-  expect(t.tools[0].inputSchema.properties.tasks.items.properties.model.enum).toEqual(SLUGS)
+  expect(t.tools[0].inputSchema.properties.tasks.items.properties.model.enum).toEqual(['auto', ...SLUGS])
 })
 
 test('2 agy missing: no tool, status says so', async ($, on) => {
@@ -277,4 +277,28 @@ test('16 no tasks, or more than 5, is refused', async ($, on) => {
   expect(text(await t.batch(six))).toContain('1 to 5 tasks')
   expect(text(await t.batch([]))).toContain('1 to 5 tasks')
   expect(t.runs().length).toBe(0)
+})
+
+test('17 auto: the arne judge picks family and effort from the brief', async ($, on) => {
+  let verdict = '{"tier":"S","effort":"low","reason":"a lookup"}'
+  const asked: any[] = []
+  on('model.complete', (_: any, e: any) => (asked.push(e), { value: { text: verdict, isAnswered: true } }))
+  const t = await boot($, on)
+  const go = async (model?: string) => {
+    await $.tool.call({ tool: 'mcp__GeminiClaude__delegate', tasks: [{ ...(model ? { model } : {}), description: 'd', prompt: 'find X' }] })
+    return t.runs().at(-1)![4]
+  }
+  expect(await go()).toBe('gemini-4-hydrogen-low')
+  expect(asked[0].prompt).toBe('find X')
+  verdict = '{"tier":"M","effort":"medium","reason":"edit"}'
+  expect(await go('auto')).toBe('gemini-4-argon-medium')
+  verdict = '{"tier":"L","effort":"low","reason":"race"}'
+  expect(await go()).toBe('gemini-4-argon-high') // L always runs at high
+  verdict = 'no json here'
+  expect(await go()).toBe('gemini-4-argon-medium') // no verdict: M · medium
+  verdict = '{"tier":"M","effort":"high","reason":"careful"}'
+  expect(await go()).toBe('gemini-4-argon-high')
+  expect(asked.length).toBe(5)
+  await go(MODEL) // an explicit slug skips the judge
+  expect(asked.length).toBe(5)
 })

@@ -25,7 +25,21 @@ let agy = 'agy'
 /// Numbers each run, so a finished one can be taken off the `running` list.
 let seq = 0
 
-type Task = { model: string; description: string; prompt: string }
+type Task = { model?: string; description: string; prompt: string }
+type Tier = 'S' | 'M' | 'L'
+type Verdict = { tier: Tier; effort: 'low' | 'medium' | 'high'; reason: string }
+
+const AUTO = 'auto'
+// arne's judge prompt (arne/hooks/backends.ts SYSTEM), kept equal by hand: a plugin can't import another's code.
+const JUDGE = `You route a coding-assistant prompt to a model tier. Reply with JSON only:
+{"tier":"S|M|L","effort":"low|medium|high","reason":"<6 words>"}
+S = trivial lookup or edit, or a search, read or list (a subagent's brief to find or map code is S).
+M = normal coding, including multi-step or multi-file chores: edits, re-renders, commits, running tools.
+L = only when the hard part is the thinking: architecture, a race or subtle bug, a security review.
+Many steps is not L: the model hands searches and grunt work to cheap subagents. When unsure, pick M.
+Effort is high when the prompt asks to think hard or be careful, or touches security.`
+// ponytail: arne's tiers onto Gemini families, Hydrogen as the Haiku stand-in; edit if Argon turns out weaker.
+const FAMILY: Record<Tier, string> = { S: 'hydrogen', M: 'argon', L: 'argon' }
 
 export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
@@ -47,7 +61,7 @@ export const register: Register = (on, options) => {
         `Takes 1 to ${MAX_PARALLEL} tasks: several tasks run in parallel, one agy process each, and their replies ` +
         'come back together. Separate calls to this tool run one after another, so put work that should happen ' +
         'at once in one call, and give parallel tasks files that do not overlap. ' +
-        `Models: ${models.join(', ')}.`,
+        `Models: ${models.join(', ')}. Leave model out (or "${AUTO}") to have the arne judge pick the model and effort from the brief.`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -59,11 +73,15 @@ export const register: Register = (on, options) => {
             items: {
               type: 'object',
               properties: {
-                model: { type: 'string', enum: models, description: 'The Gemini model slug' },
+                model: {
+                  type: 'string',
+                  enum: [AUTO, ...models],
+                  description: `The Gemini model slug, or "${AUTO}" (the default) to let the arne judge pick model and effort`,
+                },
                 description: { type: 'string', description: 'A short (3-5 word) description of the task' },
                 prompt: { type: 'string', description: 'The complete brief for the Gemini agent' },
               },
-              required: ['model', 'description', 'prompt'],
+              required: ['description', 'prompt'],
             },
           },
         },
@@ -83,7 +101,7 @@ export const register: Register = (on, options) => {
       'For routine, self-contained work (searching, reading many files, simple edits, first-pass review), ' +
       'consider the mcp__GeminiClaude__delegate tool instead of a Claude subagent: write a complete brief, ' +
       'since it starts with no context, and review any diff it leaves. Prefer Claude for design-heavy or ' +
-      'conversation-dependent work. If the user names a Gemini model (hydrogen, argon, flash), use it. ' +
+      'conversation-dependent work. If the user names a Gemini model (hydrogen, argon, flash), use it; otherwise leave model out and the arne judge picks model and effort. ' +
       `To have several Gemini agents work at once, list them as \`tasks\` in one call (up to ${MAX_PARALLEL}): ` +
       'they run in parallel, while separate calls run one after another.'
     return { sections: [...out.sections, { id: 'GeminiClaude:delegate', text, scope: 'session' }] }
@@ -93,12 +111,20 @@ export const register: Register = (on, options) => {
     const { tasks } = e as unknown as { tasks?: Task[] }
     if (!Array.isArray(tasks) || tasks.length === 0 || tasks.length > MAX_PARALLEL)
       return { result: `Give 1 to ${MAX_PARALLEL} tasks in \`tasks\`, each with model, description and prompt.` }
-    const unknown = tasks.find(t => !models.includes(t.model))
-    if (unknown) return { result: `Unknown model "${unknown.model}". Available: ${models.join(', ')}` }
+    const unknown = tasks.find(t => t.model !== undefined && t.model !== AUTO && !models.includes(t.model))
+    if (unknown) return { result: `Unknown model "${unknown.model}". Available: ${AUTO}, ${models.join(', ')}` }
     // The engine runs this tool's calls one at a time, so the fan-out happens here, inside one call.
-    const replies = await Promise.all(tasks.map(t => runAgy($, t.model, t.prompt, t.description)))
-    if (replies.length === 1) return { result: replies[0] }
-    const sections = replies.map((text, i) => `## ${i + 1}. ${tasks[i]!.description} (${tasks[i]!.model})\n\n${text}`)
+    const replies = await Promise.all(
+      tasks.map(async t => {
+        if (t.model !== undefined && t.model !== AUTO) return { model: t.model, text: await runAgy($, t.model, t.prompt, t.description) }
+        const v = await judge($, t.prompt)
+        const model = slugFor(v, models)
+        const text = await runAgy($, model, t.prompt, t.description)
+        return { model, text: `[arne: ${model}, ${v ? `${v.tier} · ${v.effort} · ${v.reason}` : 'judge gave no verdict, default'}]\n\n${text}` }
+      }),
+    )
+    if (replies.length === 1) return { result: replies[0]!.text }
+    const sections = replies.map((r, i) => `## ${i + 1}. ${tasks[i]!.description} (${r.model})\n\n${r.text}`)
     return { result: sections.join('\n\n') }
   })
 
@@ -197,6 +223,33 @@ export const register: Register = (on, options) => {
       </Box>
     )
   })
+}
+
+/// arne's Haiku judge on a brief: tier and effort, or undefined when it doesn't answer in time or in shape.
+async function judge($: EngineInterface, brief: string): Promise<Verdict | undefined> {
+  try {
+    const r = await $.model.complete({ model: 'haiku', prompt: brief.slice(0, 4000), system: JUDGE, effort: 'low' }, { timeoutMs: 3000 })
+    const m = r.isAnswered ? r.text.match(/\{[\s\S]*\}/) : null
+    const v = m ? JSON.parse(m[0]) : undefined
+    if (!['S', 'M', 'L'].includes(v?.tier) || !['low', 'medium', 'high'].includes(v?.effort)) return undefined
+    return { tier: v.tier, effort: v.effort, reason: String(v.reason ?? '').slice(0, 80) }
+  } catch {
+    return undefined
+  }
+}
+
+/// A verdict to an agy slug: the tier's family at the verdict's effort (L at high), else the nearest that exists.
+function slugFor(v: Verdict | undefined, slugs: string[]): string {
+  const { tier, effort } = v ?? { tier: 'M' as Tier, effort: 'medium' }
+  const family = slugs.filter(s => s.includes(FAMILY[tier]))
+  const want = tier === 'L' ? 'high' : effort
+  return (
+    family.find(s => s.endsWith(`-${want}`)) ??
+    family.find(s => s.endsWith('-medium')) ??
+    family[0] ??
+    slugs.find(s => FAVOURITES.test(s)) ??
+    slugs[0]!
+  )
 }
 
 /// The model slugs agy offers this account, read off `agy models`. Also settles `agy`:

@@ -33,7 +33,8 @@ What it does:
 3. **Band above the prompt:** shows "ready · N models", the running run, or the last run's model, label, seconds, tokens and ✓/✗, with a Hide button; a new run un-hides it.
 4. **Parallel runs:** the tool takes a `tasks` list of 1 to 5 tasks and runs them at once, one agy process each; the replies come back together, each under its task's heading. While several are in flight the band shows "N agents" and one row per agent (label and model); a finished one drops off.
 5. **Delegate checks:** the tool refuses a model slug not in `agy models` (in any task), an empty or over-long `tasks` list, and a brief over 30,000 characters.
-6. **Skipped:** subagents started by other subagents, `fork`, `web-fetch`, and any session where agy is missing. In that last case it only shows the status line "gemini: agy not found or signed out".
+6. **arne routing:** a task with no `model` (or `"auto"`) is judged by arne's Haiku judge prompt (copied from `arne/hooks/backends.ts`, kept equal by hand). Tier S goes to Hydrogen, M and L to Argon, at the judge's effort (L always high); no verdict means Argon medium. The reply starts with `[arne: <slug>, <tier> · <effort> · <reason>]`. An explicit slug skips the judge.
+7. **Skipped:** subagents started by other subagents, `fork`, `web-fetch`, and any session where agy is missing. In that last case it only shows the status line "gemini: agy not found or signed out".
 
 ## Steps
 

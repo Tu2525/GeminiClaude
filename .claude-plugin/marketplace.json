@@ -7,7 +7,7 @@
       "name": "GeminiClaude",
       "source": "./GeminiClaude",
       "description": "Offer Gemini models (Antigravity CLI, agy) alongside Claude subagents",
-      "version": "0.1.0"
+      "version": "0.1.1"
     }
   ]
 }

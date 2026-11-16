@@ -20,6 +20,8 @@ const MAX_RUN = 30 * 60_000
 /// Tool steps kept per run; the band shows the last few, the pane all of them.
 const MAX_STEPS = 25
 const PANE = 'gemini-runs'
+// ponytail: keep in step with plugin.json by hand; no manifest read from a module.
+const VERSION = '0.1.1'
 // Windows caps a command line at 32767 characters, and agy takes the prompt only as an argument.
 const MAX_PROMPT = 30_000
 // ponytail: a guess at what the plan's unpublished rate limit bears; raise it if runs don't get throttled.
@@ -60,7 +62,7 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     // A reload mid-run would otherwise leave the band stuck on "running".
     await update($, running, () => [])
-    await $.command.register({ name: 'gemini', description: 'Open the Gemini agent runs pane: tools, tokens and thinking per agent' })
+    await $.command.register({ name: 'gemini', description: 'Show the Gemini band again if hidden, and open the agent runs pane' })
     models = await listModels($)
     if (models.length === 0) {
       $.ui.status('gemini: agy not found or signed out')
@@ -109,8 +111,9 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'gemini' }, async $ => {
+    await update($, isHidden, () => false)
     await $.ui.open({ id: PANE, title: 'Gemini agents' })
-    return { text: 'Gemini agents pane opened.' }
+    return { text: `Gemini ${VERSION}: band shown, agents pane opened.` }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -269,6 +272,7 @@ export const register: Register = (on, options) => {
           <Box flexDirection="row" alignItems="center" gap={1}>
             {icon(ui, 'sparkles', 'accent', 16)}
             <Text weight="semibold">Gemini</Text>
+            <Text dimColor>v{VERSION}</Text>
             {now && icon(ui, 'running', 'accent')}{now && <Text color="suggestion">running</Text>}
             {mark && icon(ui, mark === '✓' ? 'check' : 'x', mark === '✓' ? 'ok' : 'error')}
             <Box flexGrow={1} flexShrink={1} minWidth={0}>

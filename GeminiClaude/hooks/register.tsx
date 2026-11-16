@@ -8,13 +8,18 @@ const running = atom({ plugin: 'GeminiClaude', key: 'running' } as const, [])
 const recent = atom({ plugin: 'GeminiClaude', key: 'recent' } as const, [])
 const isOpen = atom({ plugin: 'GeminiClaude', key: 'isOpen' } as const, false)
 const isHidden = atom({ plugin: 'GeminiClaude', key: 'isHidden' } as const, false)
+const stepsShown = atom({ plugin: 'GeminiClaude', key: 'stepsShown' } as const, true)
 
 // Agent types a Gemini run can't stand in for: a fork needs this conversation,
 // web-fetch stands in for the WebFetch tool.
 const NEVER_ASK = new Set(['fork', 'web-fetch'])
 // ponytail: favours the two families named when this was written; edit to taste.
 const FAVOURITES = /hydrogen|argon/
-const TEN_MINUTES = 600_000
+// ponytail: streaming lifts $.process.run's ten-minute cap; this is a runaway guard, raise it if real tasks need more.
+const MAX_RUN = 30 * 60_000
+/// Tool steps kept per run; the band shows the last few, the pane all of them.
+const MAX_STEPS = 25
+const PANE = 'gemini-runs'
 // Windows caps a command line at 32767 characters, and agy takes the prompt only as an argument.
 const MAX_PROMPT = 30_000
 // ponytail: a guess at what the plan's unpublished rate limit bears; raise it if runs don't get throttled.
@@ -27,6 +32,13 @@ let models: string[] = []
 let agy = 'agy'
 /// Numbers each run, so a finished one can be taken off the `running` list.
 let seq = 0
+/// Writes to `running` go through one queue: with streaming, agents patch the shared list at once, and an update is read-then-write.
+let queue: Promise<unknown> = Promise.resolve()
+const inOrder = <T,>(fn: () => Promise<T>): Promise<T> => {
+  const next = queue.then(fn, fn)
+  queue = next.catch(() => {})
+  return next
+}
 
 type Task = { model?: string; description: string; prompt: string }
 type Tier = 'S' | 'M' | 'L'
@@ -48,6 +60,7 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     // A reload mid-run would otherwise leave the band stuck on "running".
     await update($, running, () => [])
+    await $.command.register({ name: 'gemini', description: 'Open the Gemini agent runs pane: tools, tokens and thinking per agent' })
     models = await listModels($)
     if (models.length === 0) {
       $.ui.status('gemini: agy not found or signed out')
@@ -95,6 +108,53 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  on('command.run', { command: 'gemini' }, async $ => {
+    await $.ui.open({ id: PANE, title: 'Gemini agents' })
+    return { text: 'Gemini agents pane opened.' }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const runs = await read($, running)
+    const done = await read($, recent)
+    const show = await read($, stepsShown)
+    const one = (r: Run, live: boolean) => (
+      <Box key={`${live ? 'r' : 'd'}-${r.id ?? r.label}-${r.started ?? ''}`} flexDirection="column">
+        <Box flexDirection="row" gap={1}>
+          <Text color={live ? 'suggestion' : r.ok === false ? 'error' : 'success'}>{live ? '›' : r.ok === false ? '✗' : '✓'}</Text>
+          <Text weight="semibold" wrap="truncate-end">{r.label}</Text>
+        </Box>
+        <Box paddingLeft={2}>
+          <Text dimColor>
+            {r.model}
+            {r.seconds !== undefined ? ` · ${r.seconds}s` : r.started ? ` · since ${new Date(r.started).toLocaleTimeString()}` : ''}
+            {r.tokens ? ` · ${r.tokens.toLocaleString()} tokens` : ''}
+            {r.thinking ? ` · ${r.thinking.toLocaleString()} thinking` : ''}
+            {r.tools ? ` · ${r.tools} tool calls` : ''}
+          </Text>
+        </Box>
+        {show && (r.steps ?? []).map((s, i) => (
+          <Box key={`${r.id}-${i}`} paddingLeft={2}>
+            <Text dimColor={!(live && s === r.activity)} wrap="truncate-end">{live && s === r.activity ? '▸' : '✓'} {s}</Text>
+          </Box>
+        ))}
+        {show && live && r.activity && !(r.steps ?? []).includes(r.activity) && (
+          <Box paddingLeft={2}>
+            <Text color="suggestion">▸ {r.activity}</Text>
+          </Box>
+        )}
+      </Box>
+    )
+    return (
+      <Box flexDirection="column" rowGap={1}>
+        {runs.length === 0 && done.length === 0 && <Text dimColor>No Gemini runs yet.</Text>}
+        <Button key="steps" plain label={show ? '▴ collapse steps' : '▾ expand steps'} onPress={() => update($, stepsShown, s => !s)} />
+        {runs.map(r => one(r, true))}
+        {done.map(r => one(r, false))}
+      </Box>
+    )
+  })
+
   // Tells Claude, in plain words, that Gemini subagents exist; the tool schema alone is easy to overlook.
   on('prompt.compose', async ($, e, next) => {
     const out = await next(e)
@@ -133,10 +193,13 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
     const type = e.subagent_type ?? 'general-purpose'
-    // Ask only for the main thread's own spawns, never a subagent's.
-    // Off unless the user opts in: Claude picks Gemini itself, guided by the prompt.compose section.
-    if (options.askOnSpawn !== true || models.length === 0 || e.agentId !== undefined || NEVER_ASK.has(type))
-      return next(e)
+    // Only the main thread's own spawns, never a subagent's.
+    if (e.agentId !== undefined || NEVER_ASK.has(type)) return next(e)
+    // autoHaiku: the arne judge reads the brief, and a trivial one runs on Haiku. A model Claude named stands.
+    if (options.autoHaiku === true && e.model === undefined && (await judge($, e.prompt))?.tier === 'S')
+      return next({ ...e, model: 'haiku' })
+    // Asking is off unless the user opts in: Claude picks Gemini itself, guided by the prompt.compose section.
+    if (options.askOnSpawn !== true || models.length === 0) return next(e)
 
     const picks = [...models.filter(m => FAVOURITES.test(m)), ...models.filter(m => !FAVOURITES.test(m))].slice(0, 3)
     const claude = `Claude (${type})`
@@ -186,7 +249,8 @@ export const register: Register = (on, options) => {
     const now = runs[runs.length - 1] // the latest-started run still in flight
     const shown: Run | null = now ?? done[0] ?? null
     if (e.props.hasSurvey || models.length === 0 || (await read($, isHidden))) return next(e)
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const ui = e.surface === 'terminal' ? { ...$.ui.resolve(e), Svg: undefined } : $.ui.resolve(e) // the terminal answers Svg with an empty Box
+    const { Box, Button, Text } = ui
     const below = await next(e) // other mods' bands stack under this one
     const tokens = shown?.tokens ? ` · ${shown.tokens.toLocaleString()} tokens` : ''
     const status =
@@ -195,40 +259,56 @@ export const register: Register = (on, options) => {
         : runs.length > 1
           ? `${runs.length} agents`
           : now
-            ? `${shown.model} · ${shown.label}…`
-            : `${shown.model} · ${shown.label} · ${shown.seconds}s${tokens}`
+            ? `${shown.model} · ${shown.label}${shown.activity ? ` · ${shown.activity}` : ""}${live(shown)}`
+            : `${shown.model} · ${shown.label} · ${shown.seconds}s${tokens}${shown.tools ? ` · ${shown.tools} tools` : ''}`
     const mark = shown === null || now ? null : shown.ok === false ? '✗' : '✓'
     return (
       <Box flexDirection="column" rowGap={e.surface === 'terminal' ? 0 : 1}>
-        <Box flexDirection="column" borderStyle="round" borderColor="promptBorder" paddingX={1}>
+        {/* The apps draw their own panel behind the band, so a box of the mod's would be a box in a box: only the terminal gets the outline. */}
+        <Box flexDirection="column" borderStyle={e.surface === 'terminal' ? 'round' : undefined} borderColor="promptBorder" paddingX={1}>
           <Box flexDirection="row" alignItems="center" gap={1}>
-            <Text color="suggestion">✦</Text>
+            {icon(ui, 'sparkles', 'accent', 16)}
             <Text weight="semibold">Gemini</Text>
-            {now && <Text color="suggestion">running</Text>}
-            {mark && <Text color={mark === '✓' ? 'success' : 'error'}>{mark}</Text>}
+            {now && icon(ui, 'running', 'accent')}{now && <Text color="suggestion">running</Text>}
+            {mark && icon(ui, mark === '✓' ? 'check' : 'x', mark === '✓' ? 'ok' : 'error')}
             <Box flexGrow={1} flexShrink={1} minWidth={0}>
               <Text dimColor wrap="truncate-end">{status}</Text>
             </Box>
-            <Button key="agents" plain label={open ? '▴ agents' : '▾ agents'} onPress={() => update($, isOpen, o => !o)} />
+            <Button key="details" plain label="Details" onPress={() => $.ui.open({ id: PANE, title: 'Gemini agents' })} />
+            {icon(ui, open ? 'up' : 'down')}
+            <Button key="agents" plain label="agents" onPress={() => update($, isOpen, o => !o)} />
             <Button key="hide" plain label="Hide" onPress={() => update($, isHidden, () => true)} />
           </Box>
           {/* One row per agent still in flight; a finished one drops off. */}
           {(open || runs.length > 1) &&
             runs.map(r => (
-              <Box key={String(r.id)} flexDirection="row" gap={1}>
-                <Text color="suggestion">›</Text>
-                <Box flexGrow={1} flexShrink={1} minWidth={0}>
-                  <Text wrap="truncate-end">{r.label}</Text>
+              <Box key={String(r.id)} flexDirection="column">
+                <Box flexDirection="row" gap={1}>
+                  {icon(ui, 'running', 'accent')}
+                  <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                    <Text wrap="truncate-end">{r.label}</Text>
+                  </Box>
+                  {/* ponytail: start time, not a live counter; tick an atom with $.clock.every if one is wanted. */}
+                  <Text dimColor>{r.model}{open && r.started ? ` · since ${new Date(r.started).toLocaleTimeString()}` : ''}{live(r)}</Text>
                 </Box>
-                {/* ponytail: start time, not a live counter; tick an atom with $.clock.every if one is wanted. */}
-                <Text dimColor>{r.model}{open && r.started ? ` · since ${new Date(r.started).toLocaleTimeString()}` : ''}</Text>
+                {/* What the agent is doing now, and the steps before it. */}
+                {(open ? (r.steps ?? []).filter(s => s !== r.activity).slice(-4) : []).map((s, i) => (
+                  <Box key={`${r.id}-s${i}`} paddingLeft={2}>
+                    <Text dimColor wrap="truncate-end">✓ {s}</Text>
+                  </Box>
+                ))}
+                {r.activity && (
+                  <Box paddingLeft={2}>
+                    <Text color="suggestion" wrap="truncate-end">▸ {r.activity}</Text>
+                  </Box>
+                )}
               </Box>
             ))}
           {open && runs.length === 0 && <Text dimColor>no agents running</Text>}
           {open &&
             done.map((r, i) => (
               <Box key={`done-${i}`} flexDirection="row" gap={1}>
-                <Text color={r.ok === false ? 'error' : 'success'}>{r.ok === false ? '✗' : '✓'}</Text>
+                {icon(ui, r.ok === false ? 'x' : 'check', r.ok === false ? 'error' : 'ok')}
                 <Box flexGrow={1} flexShrink={1} minWidth={0}>
                   <Text dimColor wrap="truncate-end">{r.label}</Text>
                 </Box>
@@ -242,10 +322,37 @@ export const register: Register = (on, options) => {
   })
 }
 
+// Lucide icons (ISC licence), 24px viewBox, as inner SVG markup.
+const ICONS = {
+  sparkles: '<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4M22 5h-4M4 17v2M5 18H3"/>',
+  running: '<path d="M21 12a9 9 0 1 1-6.219-8.56"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="1s" repeatCount="indefinite"/></path>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  down: '<path d="m6 9 6 6 6-6"/>',
+  up: '<path d="m18 15-6-6-6 6"/>',
+} as const
+// Colourblind-safe: blue for ok/accent, orange for failure (not green/red).
+const TONE = { accent: '#58a6ff', ok: '#58a6ff', error: '#f0883e', dim: '#8b949e' } as const
+const GLYPH = { sparkles: '✦', running: '›', check: '✓', x: '✗', down: '▾', up: '▴' } as const
+const COLOR = { accent: 'suggestion', ok: 'success', error: 'error', dim: undefined } as const
+
+/// A Lucide icon where the surface can draw SVG, the old glyph in the terminal.
+function icon(ui: any, name: keyof typeof ICONS, tone: keyof typeof TONE = 'dim', size = 14) {
+  const { Svg, Text } = ui
+  if (!Svg) return <Text color={COLOR[tone]}>{GLYPH[name]}</Text>
+  const source = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="${TONE[tone]}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>`
+  return <Svg source={source} alt={name} width={size} height={size} isInteractive={name === 'running'} />
+}
+
+/// The live counters of a run in flight, as a suffix: " · 3 tools · 120 thinking".
+function live(r: Run): string {
+  return `${r.tools ? ` · ${r.tools} tools` : ''}${r.thinking ? ` · ${r.thinking.toLocaleString()} thinking` : ''}`
+}
+
 /// arne's Haiku judge on a brief: tier and effort, or undefined when it doesn't answer in time or in shape.
 async function judge($: EngineInterface, brief: string): Promise<Verdict | undefined> {
   try {
-    const r = await $.model.complete({ model: 'haiku', prompt: brief.slice(0, 4000), system: JUDGE, effort: 'low' }, { timeoutMs: 3000 })
+    const r = await $.model.complete({ model: 'haiku', prompt: brief.slice(0, 4000), system: JUDGE, effort: 'low', timeoutMs: 3000 })
     const m = r.isAnswered ? r.text.match(/\{[\s\S]*\}/) : null
     const v = m ? JSON.parse(m[0]) : undefined
     if (!['S', 'M', 'L'].includes(v?.tier) || !['low', 'medium', 'high'].includes(v?.effort)) return undefined
@@ -296,45 +403,124 @@ async function listModels($: EngineInterface): Promise<string[]> {
 async function runAgy($: EngineInterface, model: string, prompt: string, label: string): Promise<string> {
   const started = Date.now()
   const id = ++seq
-  let out: { text: string; ok: boolean; tokens?: number } = { text: '', ok: false }
+  let out: { text: string; ok: boolean; tokens?: number; thinking?: number; tools?: number; steps?: string[] } = { text: '', ok: false }
+  const patch = (p: Partial<Run>) => inOrder(() => update($, running, runs => runs.map(r => (r.id === id ? { ...r, ...p } : r))))
   try {
-    await update($, running, runs => [...runs, { id, model, label, started }])
+    await inOrder(() => update($, running, runs => [...runs, { id, model, label, started, activity: 'starting…' }]))
     await update($, isHidden, () => false)
-    out = await callAgy($, model, prompt)
+    out = await callAgy($, model, prompt, patch)
     return out.text
   } finally {
     const seconds = Math.round((Date.now() - started) / 100) / 10
     // `recent` first, so the band never draws the previous result between the two writes.
-    await update($, recent, rs => [{ model, label, seconds, tokens: out.tokens, ok: out.ok }, ...rs].slice(0, MAX_RECENT))
-    await update($, running, runs => runs.filter(r => r.id !== id))
+    await update($, recent, rs =>
+      [{ model, label, seconds, tokens: out.tokens, thinking: out.thinking, tools: out.tools, steps: out.steps, ok: out.ok }, ...rs].slice(0, MAX_RECENT),
+    )
+    await inOrder(() => update($, running, runs => runs.filter(r => r.id !== id)))
   }
 }
 
-async function callAgy($: EngineInterface, model: string, prompt: string): Promise<{ text: string; ok: boolean; tokens?: number }> {
+/// One line for a tool step: its name and the first string argument (a command, a path, a query).
+function describe(s: { tool_name?: string; tool_info?: { parameters?: Record<string, unknown> } }): string {
+  const arg = Object.values(s.tool_info?.parameters ?? {}).find(v => typeof v === 'string') as string | undefined
+  const one = (arg ?? '').replace(/\s+/g, ' ').trim()
+  return `${s.tool_name ?? 'tool'}${one ? ` ${one.length > 70 ? `${one.slice(0, 70)}…` : one}` : ''}`
+}
+
+/// Runs agy with `--output-format stream-json` and feeds each event to `patch`, so the band shows
+/// the tool it is on, a token and thinking count, and the last few steps. Resolves with the final reply.
+async function callAgy(
+  $: EngineInterface,
+  model: string,
+  prompt: string,
+  patch: (p: Partial<Run>) => Promise<unknown>,
+): Promise<{ text: string; ok: boolean; tokens?: number; thinking?: number; tools?: number; steps?: string[] }> {
   if (prompt.length > MAX_PROMPT)
     return {
       text: `The brief is ${prompt.length} characters, over the ${MAX_PROMPT} limit. Write the long part to a file in the working directory and name that file in a shorter brief.`,
       ok: false,
     }
-  try {
-    // ponytail: $.process.run caps a run at ten minutes; stream with $.process.spawn if tasks run longer.
-    const run = await $.process.run([agy, '-p', prompt, '--model', model, '--output-format', 'json'], {
-      timeoutMs: TEN_MINUTES,
-    })
-    let reply: { response?: string; error?: unknown; status?: string; usage?: { total_tokens?: number } } = {}
+  let buf = ''
+  let err = ''
+  let reply = ''
+  let writing = false
+  let steps: string[] = []
+  let tokens = 0
+  let thinking = 0
+  let tools = 0
+  let final: { status?: string; response?: string; error?: unknown; usage?: { total_tokens?: number; thinking_tokens?: number } } | undefined
+  const handle = async (line: string) => {
+    let ev: any
     try {
-      reply = JSON.parse(run.stdout) ?? {}
+      ev = JSON.parse(line)
     } catch {
-      return { text: run.stdout.trim() || `agy exited ${run.exitCode}: ${run.stderr.trim()}`, ok: false }
+      return
     }
-    const tokens = reply.usage?.total_tokens
-    if (reply.error || run.exitCode !== 0) {
-      const why = reply.error ? (typeof reply.error === 'string' ? reply.error : JSON.stringify(reply.error)) : run.stderr.trim()
-      return { text: `agy failed (${reply.status ?? `exit ${run.exitCode}`}): ${why}`, ok: false, tokens }
+    if (ev?.event === 'result') {
+      final = ev.result ?? {}
+      return
     }
-    const denied = run.stderr.trim() ? `\n\nagy notices (soft-denied actions show here):\n${run.stderr.trim()}` : ''
-    return { text: `${reply.response ?? ''}${denied}`, ok: true, tokens }
-  } catch (err) {
-    return { text: `agy did not finish: ${String(err)}`, ok: false }
+    const s = ev?.step_update
+    if (ev?.event !== 'step_update' || !s) return
+    if (s.step_type === 'tool' && s.state === 'ACTIVE') {
+      writing = false
+      tools++
+      const now = describe(s)
+      steps = [...steps, now].slice(-MAX_STEPS)
+      await patch({ activity: now, steps, tools })
+    } else if (s.step_type === 'agent_response') {
+      if (typeof s.text_delta === 'string') {
+        reply += s.text_delta
+        // Once per stretch of writing, not per delta, so the band doesn't redraw on every word.
+        if (!writing) {
+          writing = true
+          await patch({ activity: 'writing reply…' })
+        }
+      }
+      if (s.usage) {
+        tokens += s.usage.total_tokens ?? 0
+        thinking += s.usage.thinking_tokens ?? 0
+        await patch({ tokens, thinking })
+      }
+    }
   }
+  let code: number | null = null
+  try {
+    const proc = $.process.spawn({ argv: [agy, '-p', prompt, '--model', model, '--output-format', 'stream-json'] })
+    // ponytail: the cap is checked when output arrives, so a silent hang is not cut; kill it from the band if that bites.
+    const deadline = Date.now() + MAX_RUN
+    await patch({ activity: 'thinking…' })
+    for (;;) {
+      const n = await proc.next()
+      if (n.done) {
+        code = n.value.code
+        break
+      }
+      if (n.value.stream === 'stderr') {
+        err += n.value.text
+        continue
+      }
+      buf += n.value.text
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      for (const line of lines) await handle(line)
+      if (Date.now() > deadline) {
+        await proc.return(undefined as never) // ends the loop, which kills the child
+        return { text: `agy was stopped after ${MAX_RUN / 60_000} minutes.`, ok: false, tokens, thinking, tools, steps }
+      }
+    }
+    if (buf.trim()) await handle(buf)
+  } catch (err2) {
+    return { text: `agy did not finish: ${String(err2)}`, ok: false, tokens, thinking, tools, steps }
+  }
+  const total = final?.usage?.total_tokens ?? tokens
+  const think = final?.usage?.thinking_tokens ?? thinking
+  if (!final)
+    return { text: reply.trim() || `agy exited ${code}: ${err.trim()}`, ok: false, tokens: total, thinking: think, tools, steps }
+  if (final.error || (code !== null && code !== 0)) {
+    const why = final.error ? (typeof final.error === 'string' ? final.error : JSON.stringify(final.error)) : err.trim()
+    return { text: `agy failed (${final.status ?? `exit ${code}`}): ${why}`, ok: false, tokens: total, thinking: think, tools, steps }
+  }
+  const denied = err.trim() ? `\n\nagy notices (soft-denied actions show here):\n${err.trim()}` : ''
+  return { text: `${final.response ?? reply}${denied}`, ok: true, tokens: total, thinking: think, tools, steps }
 }

@@ -88,6 +88,7 @@ Each Gemini run starts cold: it sees the working directory but nothing of your c
 | Option | Default | What it does |
 | --- | --- | --- |
 | `askOnSpawn` | off | Before a Claude subagent starts, asks whether to run it on a Gemini model instead. Offers up to three models, Hydrogen and Argon first. |
+| `autoHaiku` | off | Before a Claude subagent starts, judges its brief and runs a trivial one (a lookup, a search, a small edit) on Haiku, without asking. A model Claude names is kept. |
 
 ## Limits
 

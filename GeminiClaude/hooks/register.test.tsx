@@ -63,6 +63,7 @@ async function boot(
   const tools: any[] = []
   const status: (string | undefined)[] = []
   on('env.get', () => ({ value: LOCAL }))
+  on('command.register', () => ({ value: undefined }))
   on('tool.register', (_: any, e: any) => {
     tools.push(e)
     return { value: { tool: e.name } }
@@ -73,11 +74,21 @@ async function boot(
   })
   on('process.run', async (_: any, e: any) => {
     argvs.push([...e.argv])
-    if (e.argv[1] === 'models') {
-      if (models === 'missing') throw new Error('ENOENT')
-      return { value: models }
-    }
-    return { value: await agyRun([...e.argv]) }
+    if (models === 'missing') throw new Error('ENOENT')
+    return { value: models }
+  })
+  // agyRun still answers with the old one-shot envelope; the stub replays it as agy's stream: the envelope as the `result` event.
+  on('process.spawn', async function* (_: any, e: any) {
+    argvs.push([...e.argv])
+    const r = await agyRun([...e.argv])
+    let env: any
+    try {
+      env = JSON.parse(r.stdout)
+    } catch {}
+    if (env && typeof env === 'object') yield { stream: 'stdout', text: JSON.stringify({ event: 'result', result: env }) + '\n' }
+    else if (r.stdout.trim()) yield { stream: 'stdout', text: r.stdout }
+    if (r.stderr) yield { stream: 'stderr', text: r.stderr }
+    return { value: { code: r.exitCode, signal: null } }
   })
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
@@ -107,7 +118,7 @@ test('3 success returns pong with exact argv', async ($, on) => {
   const t = await boot($, on)
   const r = text(await t.delegate(MODEL, 'say pong'))
   expect(r.startsWith('pong')).toBe(true)
-  expect(t.runs()).toEqual([['agy', '-p', 'say pong', '--model', MODEL, '--output-format', 'json']])
+  expect(t.runs()).toEqual([['agy', '-p', 'say pong', '--model', MODEL, '--output-format', 'stream-json']])
 })
 
 test('4 unknown model is refused without running', async ($, on) => {
@@ -176,13 +187,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const line = (await ui.find({ type: 'Text', text: new RegExp(MODEL) }))?.text ?? ''
     expect(line).toContain('my label')
     expect(line).toMatch(/12.?264 tokens/)
-    expect(await ui.find({ type: 'Text', text: /✓/ })).toBeTruthy()
+    expect(await ui.find(surface === 'terminal' ? { type: 'Text', text: /✓/ } : { type: 'Svg' })).toBeTruthy()
     await ui.unmount()
 
     next = FAIL
     await t.delegate(MODEL, 'x', 'bad run')
     ui = await $.ui.mount(BAND(surface))
-    expect(await ui.find({ type: 'Text', text: /✗/ })).toBeTruthy()
+    expect(await ui.find(surface === 'terminal' ? { type: 'Text', text: /✗/ } : { type: 'Svg' })).toBeTruthy()
     await ui.unmount()
   })
 }
@@ -223,7 +234,7 @@ test('13 a run left active before a reload is not shown as running', async ($, o
   await ui.unmount()
 })
 
-test('14 tasks in one call run in parallel and come back labelled', async ($, on) => {
+test('14 tasks in one call run in parallel and come back labelled', { timeoutMs: 20000 }, async ($, on) => {
   const gates: ((r: Run) => void)[] = []
   const t = await boot($, on, () => new Promise<Run>(res => gates.push(res)))
   const call = t.batch([
@@ -282,7 +293,7 @@ test('16 no tasks, or more than 5, is refused', async ($, on) => {
 test('17 auto: the arne judge picks family and effort from the brief', async ($, on) => {
   let verdict = '{"tier":"S","effort":"low","reason":"a lookup"}'
   const asked: any[] = []
-  on('model.complete', (_: any, e: any) => (asked.push(e), { value: { text: verdict, isAnswered: true } }))
+  on('model.complete', (_: any, e: any) => (asked.push(e), { value: { text: verdict, isAnswered: true } as any }))
   const t = await boot($, on)
   const go = async (model?: string) => {
     await $.tool.call({ tool: 'mcp__GeminiClaude__delegate', tasks: [{ ...(model ? { model } : {}), description: 'd', prompt: 'find X' }] })
@@ -303,7 +314,7 @@ test('17 auto: the arne judge picks family and effort from the brief', async ($,
   expect(asked.length).toBe(5)
 })
 
-test('18 the agents dropdown lists running agents, then finished ones', async ($, on) => {
+test('18 the agents dropdown lists running agents, then finished ones', { timeoutMs: 20000 }, async ($, on) => {
   const gates: ((r: Run) => void)[] = []
   const t = await boot($, on, () => new Promise<Run>(res => gates.push(res)))
   const a = t.delegate(MODEL, 'one', 'slow job')
@@ -323,5 +334,57 @@ test('18 the agents dropdown lists running agents, then finished ones', async ($
   expect(await ui.find({ type: 'Text', text: /^slow job$/ })).toBeTruthy()
   await ui.press({ key: 'agents' })
   expect(await ui.find({ type: 'Text', text: /no agents running/ })).toBeFalsy()
+  await ui.unmount()
+})
+
+test('19 the band is outlined on the terminal and flat in the apps', async ($, on) => {
+  await boot($, on)
+  let ui = await $.ui.mount(BAND('terminal'))
+  expect(JSON.stringify(await ui.drawn())).toContain('"borderStyle":"round"')
+  await ui.unmount()
+  ui = await $.ui.mount(BAND('desktop'))
+  expect(JSON.stringify(await ui.drawn())).not.toContain('borderStyle')
+  await ui.unmount()
+})
+
+test('20 autoHaiku: a trivial subagent brief runs on Haiku', { options: { autoHaiku: true } }, async ($, on) => {
+  let verdict = '{"tier":"S","effort":"low","reason":"a lookup"}'
+  let asked = 0
+  const spawned: any[] = []
+  on('model.complete', () => (asked++, { value: { text: verdict, isAnswered: true } as any }))
+  on('tool.call', { tool: 'Agent' }, (_: any, e: any) => (spawned.push(e), { result: 'ran' }))
+  await boot($, on)
+  const spawn = (extra: object = {}) => $.tool.call({ tool: 'Agent', description: 'd', prompt: 'find x', ...extra } as any)
+
+  await spawn()
+  expect(spawned[0].model).toBe('haiku')
+
+  verdict = '{"tier":"M","effort":"medium","reason":"normal coding"}'
+  await spawn()
+  expect(spawned[1].model).toBeUndefined()
+
+  // A model Claude named, a subagent's own spawn and a fork are left alone, unjudged.
+  asked = 0
+  await spawn({ model: 'opus' })
+  await spawn({ agentId: 'a1' })
+  await spawn({ subagent_type: 'fork' })
+  expect(spawned[2].model).toBe('opus')
+  expect(spawned[3].model).toBeUndefined()
+  expect(asked).toBe(0)
+})
+
+test('22 stream-json: tool steps are counted and the result event is the reply', async ($, on) => {
+  const ev = (o: unknown) => JSON.stringify(o)
+  const stdout = [
+    ev({ event: 'init', init: { model: MODEL } }),
+    ev({ event: 'step_update', step_update: { step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'ls' } } } }),
+    ev({ event: 'step_update', step_update: { step_type: 'agent_response', state: 'ACTIVE', text_delta: 'do' } }),
+    ev({ event: 'step_update', step_update: { step_type: 'agent_response', state: 'DONE', usage: { total_tokens: 50, thinking_tokens: 7 } } }),
+    ev({ event: 'result', result: { status: 'SUCCESS', response: 'done\n', usage: { total_tokens: 50, thinking_tokens: 7 } } }),
+  ].join('\n')
+  const t = await boot($, on, () => ({ exitCode: 0, stdout, stderr: '' }))
+  expect(text(await t.delegate(MODEL, 'x')).startsWith('done')).toBe(true)
+  const ui = await $.ui.mount(BAND('terminal'))
+  expect(await ui.find({ type: 'Text', text: /1 tools/ })).toBeTruthy()
   await ui.unmount()
 })

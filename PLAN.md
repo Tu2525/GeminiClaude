@@ -21,7 +21,7 @@ The goal is for Gemini models, mainly Hydrogen as a cheaper stand-in for Haiku, 
 
 The source is in `GeminiClaude/`. It is installed from this folder as the marketplace plugin `GeminiClaude@GeminiClaude`, so every session (CLI and desktop) loads it; run `/reload-plugins` after edits. It has these files:
 
-- `.claude-plugin/plugin.json`: the manifest, plus one option, `askOnSpawn` (default off).
+- `.claude-plugin/plugin.json`: the manifest, plus two options, `askOnSpawn` and `autoHaiku` (both default off). With `autoHaiku` on, the arne judge reads each main-thread Agent brief and a tier-S one runs on Haiku.
 - `hooks/hooks.json`: points to `./register.tsx`.
 - `hooks/register.tsx`: all the logic.
 - `types/index.d.ts`: the state contract for the band's values.
@@ -34,7 +34,8 @@ What it does:
 4. **Parallel runs:** the tool takes a `tasks` list of 1 to 5 tasks and runs them at once, one agy process each; the replies come back together, each under its task's heading. While several are in flight the band shows "N agents" and one row per agent (label and model); a finished one drops off.
 5. **Delegate checks:** the tool refuses a model slug not in `agy models` (in any task), an empty or over-long `tasks` list, and a brief over 30,000 characters.
 6. **arne routing:** a task with no `model` (or `"auto"`) is judged by arne's Haiku judge prompt (copied from `arne/hooks/backends.ts`, kept equal by hand). Tier S goes to Hydrogen, M and L to Argon, at the judge's effort (L always high); no verdict means Argon medium. The reply starts with `[arne: <slug>, <tier> · <effort> · <reason>]`. An explicit slug skips the judge.
-7. **Skipped:** subagents started by other subagents, `fork`, `web-fetch`, and any session where agy is missing. In that last case it only shows the status line "gemini: agy not found or signed out".
+7. **Live view:** the band shows the tool each agent is on, tool and thinking counts; `/gemini` or the band's Details button opens a side pane with every agent's tool-call history, tokens and thinking (finished runs keep the last 25 steps).
+8. **Skipped:** subagents started by other subagents, `fork`, `web-fetch`, and any session where agy is missing. In that last case it only shows the status line "gemini: agy not found or signed out".
 
 ## Steps
 
@@ -60,7 +61,8 @@ What it does:
 
 ## Known limits
 
-- **10-minute cap:** a run is cut off after 10 minutes, the most `$.process.run` allows. If tasks run longer, switch to `$.process.spawn` streaming.
+- **30-minute cap:** a run streams through `$.process.spawn` (`--output-format stream-json`) and is stopped after 30 minutes, checked when output arrives; a silent hang is not cut.
+- **No thinking text:** agy's stream gives a `thinking_tokens` count per step, not the reasoning itself.
 - **Parallel only inside one call:** the engine runs this tool's calls one at a time (measured 2026-11-14: two calls in one message ran back to back), so several Geminis work at once only as `tasks` of one call, and Claude waits for all of them. The cap of 5 is a guess at the plan's rate limit.
 - **Shared working tree:** parallel runs edit the same folder, so give them files that don't overlap.
 - **No follow-ups:** a Gemini subagent can't be continued with SendMessage, and it starts with none of this conversation's context.

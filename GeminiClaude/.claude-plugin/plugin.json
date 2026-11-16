@@ -1,6 +1,6 @@
 {
   "name": "GeminiClaude",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": { "name": "Tu2525" },
   "license": "MIT",
   "repository": "https://github.com/Tu2525/GeminiClaude",
@@ -11,6 +11,12 @@
       "type": "boolean",
       "title": "Ask Claude or Gemini on each subagent",
       "description": "Before a Claude subagent starts, ask whether to run it on a Gemini model instead",
+      "default": false
+    },
+    "autoHaiku": {
+      "type": "boolean",
+      "title": "Run trivial subagents on Haiku",
+      "description": "Before a Claude subagent starts, judge its brief and run a trivial one (a lookup, a search, a small edit) on Haiku, without asking. A model Claude names is kept.",
       "default": false
     }
   }

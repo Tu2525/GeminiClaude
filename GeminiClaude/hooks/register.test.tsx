@@ -63,6 +63,9 @@ async function boot(
   const tools: any[] = []
   const status: (string | undefined)[] = []
   on('env.get', () => ({ value: LOCAL }))
+  const store = new Map<string, unknown>()
+  on('store.get', (_: any, e: any) => ({ value: store.get(e.key) }))
+  on('store.set', (_: any, e: any) => (store.set(e.key, e.value), { value: undefined }))
   on('command.register', () => ({ value: undefined }))
   on('tool.register', (_: any, e: any) => {
     tools.push(e)
@@ -371,6 +374,18 @@ test('20 autoHaiku: a trivial subagent brief runs on Haiku', { options: { autoHa
   expect(spawned[2].model).toBe('opus')
   expect(spawned[3].model).toBeUndefined()
   expect(asked).toBe(0)
+})
+
+const compose = async ($: any) => JSON.stringify(await $.prompt.compose({ promptModel: 'haiku', outputStyle: null, tools: [], traits: [], surfaces: [], sections: [] }))
+test('23 managerSession (default on): the prompt routes delegate through a Haiku session', async ($, on) => {
+  on('prompt.compose', (_: any, e: any) => ({ sections: e.sections }))
+  await boot($, on)
+  expect(await compose($)).toContain('start_session')
+})
+test('24 managerSession off: no manager wording', { options: { managerSession: false } }, async ($, on) => {
+  on('prompt.compose', (_: any, e: any) => ({ sections: e.sections }))
+  await boot($, on)
+  expect(await compose($)).not.toContain('start_session')
 })
 
 test('22 stream-json: tool steps are counted and the result event is the reply', async ($, on) => {

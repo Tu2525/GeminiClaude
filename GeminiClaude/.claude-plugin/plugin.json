@@ -7,6 +7,12 @@
   "types": "./types/index.d.ts",
   "description": "Offer Gemini models (Antigravity CLI, agy) alongside Claude subagents",
   "userConfig": {
+    "managerSession": {
+      "type": "boolean",
+      "title": "Manage Gemini agents from a Haiku session",
+      "description": "Delegate calls lock the chat, so Claude opens a separate Haiku session that runs the Gemini agents and reports back. Turn off to call delegate in the main chat.",
+      "default": true
+    },
     "askOnSpawn": {
       "type": "boolean",
       "title": "Ask Claude or Gemini on each subagent",

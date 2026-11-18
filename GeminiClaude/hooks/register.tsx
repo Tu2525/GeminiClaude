@@ -60,10 +60,13 @@ const FAMILY: Record<Tier, string> = { S: 'hydrogen', M: 'argon', L: 'argon' }
 
 export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
-    // A reload mid-run would otherwise leave the band stuck on "running".
+    // A reload mid-run would otherwise leave the band stuck on "running"; runs found here died with the last session.
+    const lost = await read($, running)
+    await note($, `session start v${VERSION}${lost.length ? `; ${lost.length} run(s) died with the last session: ${lost.map(r => r.label).join(', ')}` : ''}`)
     await update($, running, () => [])
     await $.command.register({ name: 'gemini', description: 'Show the Gemini band again if hidden, and open the agent runs pane' })
     models = await listModels($)
+    await note($, `agy at ${agy}, ${models.length} models`)
     if (models.length === 0) {
       $.ui.status('gemini: agy not found or signed out')
       return next(e)
@@ -110,7 +113,11 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'gemini' }, async $ => {
+  on('command.run', { command: 'gemini' }, async ($, e) => {
+    if (String((e as any).args ?? '').trim() === 'log') {
+      const lines = (await readLog($)).slice(-40).map(l => `${new Date(l.t).toLocaleString()}  ${l.text}`)
+      return { text: lines.join('\n') ||'Log is empty.' }
+    }
     await update($, isHidden, () => false)
     await $.ui.open({ id: PANE, title: 'Gemini agents' })
     return { text: `Gemini ${VERSION}: band shown, agents pane opened.` }
@@ -154,6 +161,10 @@ export const register: Register = (on, options) => {
         <Button key="steps" plain label={show ? '▴ collapse steps' : '▾ expand steps'} onPress={() => update($, stepsShown, s => !s)} />
         {runs.map(r => one(r, true))}
         {done.map(r => one(r, false))}
+        {(await readLog($)).slice(-6).map(l => (
+          <Text key={l.t + l.text} dimColor wrap="truncate-end">{new Date(l.t).toLocaleTimeString()} {l.text}</Text>
+        ))}
+        <Text dimColor>GeminiClaude v{VERSION} · /gemini log for more</Text>
       </Box>
     )
   })
@@ -162,6 +173,16 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const out = await next(e)
     if (models.length === 0) return out
+    // A delegate call blocks this chat until every task is done; a Haiku manager session takes that wait instead.
+    const manager =
+      options.managerSession === false
+        ? ''
+        : ' Standing procedure: a delegate call locks this chat until the Gemini agents finish, so do not call it here. ' +
+          'Start a separate session instead with mcp__ccd_session__start_session (initiation "user_asked", ' +
+          'context "fresh", model "haiku", use_worktree false) whose prompt tells it to call mcp__GeminiClaude__delegate ' +
+          'with the tasks you would have sent (full briefs inside), review any diff the agents leave, and report back ' +
+          'concisely. Carry on with other work here; its report arrives as a note. ' +
+          'Only when start_session is unavailable (a plain terminal), call delegate directly.'
     const text =
       'Gemini subagents: the user has Gemini models available through the Antigravity CLI. ' +
       'For routine, self-contained work (searching, reading many files, simple edits, first-pass review), ' +
@@ -169,7 +190,8 @@ export const register: Register = (on, options) => {
       'since it starts with no context, and review any diff it leaves. Prefer Claude for design-heavy or ' +
       'conversation-dependent work. If the user names a Gemini model (hydrogen, argon, flash), use it; otherwise leave model out and the arne judge picks model and effort. ' +
       `To have several Gemini agents work at once, list them as \`tasks\` in one call (up to ${MAX_PARALLEL}): ` +
-      'they run in parallel, while separate calls run one after another.'
+      'they run in parallel, while separate calls run one after another.' +
+      manager
     return { sections: [...out.sections, { id: 'GeminiClaude:delegate', text, scope: 'session' }] }
   })
 
@@ -264,6 +286,9 @@ export const register: Register = (on, options) => {
           : now
             ? `${shown.model} · ${shown.label}${shown.activity ? ` · ${shown.activity}` : ""}${live(shown)}`
             : `${shown.model} · ${shown.label} · ${shown.seconds}s${tokens}${shown.tools ? ` · ${shown.tools} tools` : ''}`
+    const log = await readUsage($)
+    const h5 = sum(log.filter(x => x.t > Date.now() - WINDOW))
+    const wk = sum(log)
     const mark = shown === null || now ? null : shown.ok === false ? '✗' : '✓'
     return (
       <Box flexDirection="column" rowGap={e.surface === 'terminal' ? 0 : 1}>
@@ -272,12 +297,12 @@ export const register: Register = (on, options) => {
           <Box flexDirection="row" alignItems="center" gap={1}>
             {icon(ui, 'sparkles', 'accent', 16)}
             <Text weight="semibold">Gemini</Text>
-            <Text dimColor>v{VERSION}</Text>
             {now && icon(ui, 'running', 'accent')}{now && <Text color="suggestion">running</Text>}
             {mark && icon(ui, mark === '✓' ? 'check' : 'x', mark === '✓' ? 'ok' : 'error')}
             <Box flexGrow={1} flexShrink={1} minWidth={0}>
               <Text dimColor wrap="truncate-end">{status}</Text>
             </Box>
+            <Text dimColor>5h {h5.runs} · {short(h5.tokens)}</Text>
             <Button key="details" plain label="Details" onPress={() => $.ui.open({ id: PANE, title: 'Gemini agents' })} />
             {icon(ui, open ? 'up' : 'down')}
             <Button key="agents" plain label="agents" onPress={() => update($, isOpen, o => !o)} />
@@ -308,6 +333,13 @@ export const register: Register = (on, options) => {
                 )}
               </Box>
             ))}
+          {open && (
+            <Box flexDirection="column">
+              <Text dimColor>last 5h: {fmt(h5)}</Text>
+              <Text dimColor>last 7 days: {fmt(wk)}</Text>
+              <Text dimColor>counted by this mod; agy's real quota shows only in its own /usage</Text>
+            </Box>
+          )}
           {open && runs.length === 0 && <Text dimColor>no agents running</Text>}
           {open &&
             done.map((r, i) => (
@@ -361,7 +393,8 @@ async function judge($: EngineInterface, brief: string): Promise<Verdict | undef
     const v = m ? JSON.parse(m[0]) : undefined
     if (!['S', 'M', 'L'].includes(v?.tier) || !['low', 'medium', 'high'].includes(v?.effort)) return undefined
     return { tier: v.tier, effort: v.effort, reason: String(v.reason ?? '').slice(0, 80) }
-  } catch {
+  } catch (err) {
+    await note($, `judge failed: ${String(err)}`)
     return undefined
   }
 }
@@ -412,17 +445,58 @@ async function runAgy($: EngineInterface, model: string, prompt: string, label: 
   try {
     await inOrder(() => update($, running, runs => [...runs, { id, model, label, started, activity: 'starting…' }]))
     await update($, isHidden, () => false)
+    await note($, `run #${id} start ${model}: ${label}`)
     out = await callAgy($, model, prompt, patch)
     return out.text
+  } catch (err) {
+    await note($, `run #${id} threw: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`)
+    throw err
   } finally {
     const seconds = Math.round((Date.now() - started) / 100) / 10
     // `recent` first, so the band never draws the previous result between the two writes.
     await update($, recent, rs =>
       [{ model, label, seconds, tokens: out.tokens, thinking: out.thinking, tools: out.tools, steps: out.steps, ok: out.ok }, ...rs].slice(0, MAX_RECENT),
     )
+    await logUsage($, out.tokens ?? 0, out.tools ?? 0)
+    await note($, `run #${id} ${out.ok ? 'ok' : `FAILED: ${out.text.slice(0, 300)}`} (${seconds}s, ${out.tokens ?? 0} tokens)`)
     await inOrder(() => update($, running, runs => runs.filter(r => r.id !== id)))
   }
 }
+
+type Logged = { t: number; tokens: number; tools: number }
+const WINDOW = 5 * 3_600_000 // agy's quota window; the weekly cap is a week
+const WEEK = 7 * 24 * 3_600_000
+
+type Entry = { t: number; text: string }
+/// A rolling log kept in the store (the mod has no filesystem) and mirrored to the debug log; it never throws.
+async function readLog($: EngineInterface): Promise<Entry[]> {
+  try {
+    const v = await $.store.get('log')
+    return Array.isArray(v) ? (v as Entry[]) : []
+  } catch {
+    return []
+  }
+}
+async function note($: EngineInterface, text: string) {
+  try {
+    $.ui.log(text, { to: 'debug' })
+    await $.store.set('log', [...(await readLog($)), { t: Date.now(), text: text.slice(0, 1500) }].slice(-200))
+  } catch {
+    // logging must never break a run
+  }
+}
+
+/// Finished runs of the last week, kept across sessions in the store (agy has no headless /usage).
+async function readUsage($: EngineInterface): Promise<Logged[]> {
+  const v = await $.store.get('usage')
+  return Array.isArray(v) ? (v as Logged[]).filter(x => x.t > Date.now() - WEEK) : []
+}
+async function logUsage($: EngineInterface, tokens: number, tools: number) {
+  await $.store.set('usage', [...(await readUsage($)), { t: Date.now(), tokens, tools }].slice(-500))
+}
+const sum = (xs: Logged[]) => ({ runs: xs.length, tokens: xs.reduce((a, x) => a + x.tokens, 0), tools: xs.reduce((a, x) => a + x.tools, 0) })
+const short = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n))
+const fmt = (u: ReturnType<typeof sum>) => `${u.runs} runs · ${short(u.tokens)} tokens · ${u.tools} tools`
 
 /// One line for a tool step: its name and the first string argument (a command, a path, a query).
 function describe(s: { tool_name?: string; tool_info?: { parameters?: Record<string, unknown> } }): string {

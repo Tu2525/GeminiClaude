@@ -21,7 +21,7 @@ const MAX_RUN = 30 * 60_000
 const MAX_STEPS = 25
 const PANE = 'gemini-runs'
 // ponytail: keep in step with plugin.json by hand; no manifest read from a module.
-const VERSION = '0.1.1'
+const VERSION = '0.1.2'
 // Windows caps a command line at 32767 characters, and agy takes the prompt only as an argument.
 const MAX_PROMPT = 30_000
 // ponytail: a guess at what the plan's unpublished rate limit bears; raise it if runs don't get throttled.
